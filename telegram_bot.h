@@ -7,9 +7,9 @@
 
 const char* WIFI_SSID = "XXXXXXX";
 const char* WIFI_PASS = "XXXXXXX";
-const char* BOT_TOKEN = "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"; 
+const char* BOT_TOKEN = "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX";
 
-String storedChatId = ""; 
+String storedChatId = "";
 
 extern float getAHTTemp();
 extern float getAHTHum();
@@ -27,7 +27,7 @@ extern void setCustomThreshold(int val);
 WiFiClientSecure client;
 UniversalTelegramBot bot(BOT_TOKEN, client);
 unsigned long lastBotCheck = 0;
-const unsigned long BOT_INTERVAL = 1000; 
+const unsigned long BOT_INTERVAL = 1000;
 
 void setupWiFiAndBot() {
   Serial.print(F("WiFi Connecting..."));
@@ -49,7 +49,7 @@ void sendBotMessage(String msg) {
 }
 
 String getStatusMsg() {
-  String m = "📊 *STATUS*\n";
+  String m = "📊 STATUS\n";
   m += "Mode: " + getModeName() + (isAutoMode()?" (AUTO)":" (MANUAL)") + "\n";
   m += "Temp: " + String(getAHTTemp(),1) + "C, Hum: " + String(getAHTHum(),0) + "%\n";
   m += "Soil: " + String(getSoilPercent()) + "% (Limit: " + String(getSoilThreshold()) + "%)\n";
@@ -63,7 +63,7 @@ void handleNewMessages(int numNewMessages) {
   for (int i = 0; i < numNewMessages; i++) {
     String chatId = String(bot.messages[i].chat_id);
     String text = bot.messages[i].text;
-    
+
     storedChatId = chatId; 
 
     if (text == "/start" || text.startsWith("/help")) {
@@ -123,4 +123,5 @@ void handleTelegram() {
     lastBotCheck = millis();
   }
 }
+
 #endif
