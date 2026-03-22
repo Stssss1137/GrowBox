@@ -1,257 +1,242 @@
+#include <WiFi.h>
 #include <Wire.h>
 #include <Adafruit_Sensor.h>
 #include <Adafruit_AHTX0.h>
 #include <LiquidCrystal_I2C.h>
-#include <WiFi.h>
+#include <FastLED.h>
+#include <FirebaseESP32.h>
 #include "telegram_bot.h"
 
-const int PIN_SOIL     = 32;
-const int PIN_LDR_DO   = 33;
-const int PIN_LED      = 18;
-const int PIN_PUMP     = 25;
+// ПІДКЛЮЧЕННЯ
+#define PIN_SOIL     32
+#define PIN_LDR_DO   33
+#define PIN_MQ135    34  
+#define PIN_WS2812   18
+#define PIN_PUMP     25
+#define PIN_FAN      26
+#define NUM_LEDS     8
 
-const long SERIAL_LOG_INTERVAL = 60000;
-const long SENSOR_READ_DELAY   = 2000;
-const int GMT_OFFSET_SEC       = 2 * 3600;
-const int DST_OFFSET_SEC       = 0;
+// ДАНІ FIREBASE і WIFI 
+#define WIFI_SSID "XXXXXXXX"
+#define WIFI_PASS "XXXXXXXX"
+#define FIREBASE_HOST "XXXXXXXXXXXXXXXXXXXXXXXX.firebaseio.com"
+#define FIREBASE_AUTH "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
 
-const unsigned long PUMP_DURATION = 5000;
-const unsigned long PUMP_COOLDOWN = 20000;
-
+FirebaseData fbData;
+FirebaseAuth fbAuth;
+FirebaseConfig fbConfig;
+CRGB leds[NUM_LEDS];
 Adafruit_AHTX0 aht;
 LiquidCrystal_I2C lcd(0x27, 20, 4);
 
-unsigned long timerSensors = 0;
-unsigned long timerSerial = 0;
+unsigned long lastUpdate = 0;
+float temp = 0.0, hum = 0.0;
+int soilPct = 0;
+int airQuality = 0; 
+bool isDark = false;
+bool soilError = false;
+bool ahtError = false;
+bool lastSoilErrorState = false;
 unsigned long pumpStartTime = 0;
 unsigned long lastPumpRunTime = 0;
+const unsigned long PUMP_DURATION = 4000;  
+const unsigned long PUMP_COOLDOWN = 20000;
 
-struct SensorData {
-  float temp = 0.0;
-  float hum = 0.0;
-  int soilRaw = 0;
-  int soilPct = 0;
-  bool isDark = false;
-  bool ahtReady = false;
-} sensors;
-
-bool pumpState = false;
-bool autoMode = true;
-int soilThreshold = 50;
-int lightDurationHours = 14;
-String currentModeName = "Custom";
-bool lastLedState = false;
-
-uint8_t LT[8] = {0x07,0x0F,0x1F,0x1F,0x1F,0x1F,0x1F,0x1F};
-uint8_t UB[8] = {0x1F,0x1F,0x1F,0x00,0x00,0x00,0x00,0x00};
-uint8_t RT[8] = {0x1C,0x1E,0x1F,0x1F,0x1F,0x1F,0x1F,0x1F};
-uint8_t LL[8] = {0x1F,0x1F,0x1F,0x1F,0x1F,0x1F,0x0F,0x07};
-uint8_t LB[8] = {0x00,0x00,0x00,0x00,0x00,0x1F,0x1F,0x1F};
-uint8_t LR[8] = {0x1F,0x1F,0x1F,0x1F,0x1F,0x1F,0x1E,0x1C};
-uint8_t UMB[8]={0x1F,0x1F,0x1F,0x00,0x00,0x00,0x1F,0x1F};
-uint8_t LMB[8]={0x1F,0x00,0x00,0x00,0x00,0x1F,0x1F,0x1F};
-
-const uint8_t bigDigits[10][2][3] = {
-  {{0,1,2}, {3,4,5}}, {{1,2,32}, {4,5,4}}, {{6,6,2}, {3,4,4}}, {{6,6,2}, {4,4,5}},
-  {{3,4,5}, {32,32,5}}, {{0,6,6}, {4,4,5}}, {{0,6,6}, {3,4,5}}, {{0,1,2}, {32,32,5}},
-  {{0,6,2}, {3,7,5}}, {{0,6,2}, {32,32,5}}
-};
-
-void updateSensors();
-void checkPumpTimer();
-void runAutoLogic();
-void renderLCD();
-void renderBigTime(int h, int m);
-void drawDigit(int col, int num);
-int mapSoilToPercent(int raw);
-void turnPumpOn(bool isManual);
-void turnPumpOff();
+String currentMode = "AUTO";
+bool lightOn = false;
+String spectrum = "full";
+bool pumpOn = false;
+bool fanOn = false;
+String currentClimate = "temperate";
+String currentStage = "veg";
+int soilTarget = 40;
+int humTarget = 55;
+int tempTarget = 24;
 
 void setup() {
-  Serial.begin(115200);
-  pinMode(PIN_LDR_DO, INPUT);
-  pinMode(PIN_LED, OUTPUT);
-  pinMode(PIN_PUMP, OUTPUT);
-  digitalWrite(PIN_PUMP, HIGH);
-  digitalWrite(PIN_LED, LOW);
-  pumpState = false;
-  lastPumpRunTime = millis() - PUMP_COOLDOWN - 1000;
+  Serial.begin(115200);
+  pinMode(PIN_LDR_DO, INPUT);
+  pinMode(PIN_MQ135, INPUT);
+  pinMode(PIN_PUMP, OUTPUT);
+  pinMode(PIN_FAN, OUTPUT);
+  digitalWrite(PIN_PUMP, LOW);
+  digitalWrite(PIN_FAN, LOW);
+  delay(500);
 
-  Wire.begin(21, 22);
-  lcd.init();
-  lcd.backlight();
+  Wire.begin(21, 22);
+  lcd.init(); lcd.backlight();
+  lcd.setCursor(0, 0); lcd.print("--- SYSTEM BOOT ---");
+  delay(1000);
 
-  uint8_t* chars[] = {LT, UB, RT, LL, LB, LR, UMB, LMB};
-  for (int i = 0; i < 8; i++) lcd.createChar(i, chars[i]);
+  lcd.setCursor(0, 1); lcd.print("1. Sensors: ");
+  if (aht.begin()) lcd.print("OK"); else lcd.print("ERR!");
+  delay(1000);
 
-  if (aht.begin()) {
-    sensors.ahtReady = true;
-    Serial.println(F("AHT20 OK"));
-  } else {
-    Serial.println(F("AHT20 Error"));
-  }
+  lcd.setCursor(0, 2); lcd.print("2. LED: OK");
+  FastLED.addLeds<WS2812, PIN_WS2812, GRB>(leds, NUM_LEDS);
+  FastLED.setBrightness(100);
+  fill_solid(leds, NUM_LEDS, CRGB::Black);
+  FastLED.show();
+  delay(1000);
 
-  setupWiFiAndBot();
-  configTime(GMT_OFFSET_SEC, DST_OFFSET_SEC, "pool.ntp.org", "time.google.com");
-
-  Serial.println(F(">>> System Ready <<<"));
+  lcd.setCursor(0, 3); lcd.print("3. WiFi: ");
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  int wifiAttempts = 0;
+  while (WiFi.status() != WL_CONNECTED && wifiAttempts < 20) { delay(500); wifiAttempts++; }
+  if (WiFi.status() == WL_CONNECTED) lcd.print("OK"); else lcd.print("ERR");
+  delay(1000);
+  lcd.clear(); lcd.setCursor(0, 0); lcd.print("4. NTP: ");
+  configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+  time_t now = time(nullptr);
+  int timeAttempts = 0;
+  while (now < 8 * 3600 * 2 && timeAttempts < 15) { delay(500); now = time(nullptr); timeAttempts++; }
+  lcd.print((now > 100000) ? "OK" : "SKIP");
+  delay(1000);
+  lcd.setCursor(0, 1); lcd.print("5. Cloud: INIT...");
+  setupTelegram();
+  fbConfig.host = FIREBASE_HOST;
+  fbConfig.signer.tokens.legacy_token = FIREBASE_AUTH;
+  Firebase.begin(&fbConfig, &fbAuth);
+  Firebase.reconnectWiFi(true);
+  lcd.setCursor(10, 1); lcd.print("OK     ");
+  delay(1500);
+  lcd.clear(); lcd.setCursor(0, 1); lcd.print(" >> SYSTEM READY << ");
+  delay(2000); lcd.clear();
 }
 
 void loop() {
-  unsigned long now = millis();
+  handleTelegram();
 
-  checkPumpTimer();
-
-  if (now - timerSensors > SENSOR_READ_DELAY) {
-    timerSensors = now;
-    updateSensors();
-    runAutoLogic();
-    renderLCD();
-  }
-
-  if (now - timerSerial > SERIAL_LOG_INTERVAL) {
-    timerSerial = now;
-    Serial.printf("[LOG] Mode:%s Soil:%d%% Pump:%d LED:%d Dark:%d\n",
-                  autoMode ? "AUTO" : "MANUAL", sensors.soilPct, pumpState, lastLedState, sensors.isDark);
-  }
-
-  handleTelegram();
-  delay(10);
+  if (pumpOn && (millis() - pumpStartTime >= PUMP_DURATION)) {
+    pumpOn = false;
+    lastPumpRunTime = millis();
+    Firebase.setBool(fbData, "/growbox/controls/pumpOn", false);
+  }
+  if (millis() - lastUpdate > 3000) {
+    lastUpdate = millis();
+    readSensors();
+    checkSensorErrors(); 
+    updateFirebaseSensors();
+    getFirebaseControls();
+    applyControls();
+    updateLCD();
+  }
 }
 
-void updateSensors() {
-  if (sensors.ahtReady) {
-    sensors_event_t h, t;
-    aht.getEvent(&h, &t);
-    sensors.temp = t.temperature;
-    sensors.hum = h.relative_humidity;
-  }
-  sensors.soilRaw = analogRead(PIN_SOIL);
-  sensors.soilPct = mapSoilToPercent(sensors.soilRaw);
-  sensors.isDark = (digitalRead(PIN_LDR_DO) == HIGH);
+void readSensors() {
+  sensors_event_t h, t;
+  if(aht.getEvent(&h, &t)) { 
+    temp = t.temperature; hum = h.relative_humidity; 
+    ahtError = false;
+  } else {
+    temp = -99; hum = -99; ahtError = true;
+  }
+  int rawSoil = analogRead(PIN_SOIL);
+  if (rawSoil >= 4090) { 
+    soilPct = -1; soilError = true;
+  } else {
+    soilPct = constrain(map(rawSoil, 4095, 1500, 0, 100), 0, 100);
+    soilError = false;
+  }
+
+  airQuality = constrain(map(analogRead(PIN_MQ135), 0, 4095, 0, 100), 0, 100);
+  isDark = (digitalRead(PIN_LDR_DO) == HIGH);
 }
 
-int mapSoilToPercent(int raw) {
-  return constrain(map(raw, 4095, 1500, 0, 100), 0, 100);
+void checkSensorErrors() {
+  if (soilError && !lastSoilErrorState) {
+    sendBotMessage("Датчик ґрунту ВІДКЛЮЧЕНО! Полив заблоковано");
+    lastSoilErrorState = true;
+    if (pumpOn) { pumpOn = false; Firebase.setBool(fbData, "/growbox/controls/pumpOn", false); }
+  } else if (!soilError && lastSoilErrorState) {
+    sendBotMessage(" Датчик ґрунту відновлено");
+    lastSoilErrorState = false;
+  }
 }
 
-void turnPumpOn(bool isManual) {
-  pumpState = true;
-  pumpStartTime = millis();
-  digitalWrite(PIN_PUMP, LOW);
-  if (isManual) Serial.println(F(">>> MANUAL PUMP"));
-  else Serial.println(F(">>> AUTO PUMP"));
+void updateFirebaseSensors() {
+  Firebase.setFloat(fbData, "/growbox/sensors/temp", temp);
+  Firebase.setFloat(fbData, "/growbox/sensors/hum", hum);
+  Firebase.setInt(fbData, "/growbox/sensors/soil", soilPct);
+  Firebase.setInt(fbData, "/growbox/sensors/air", airQuality);
 }
 
-void turnPumpOff() {
-  if (pumpState) {
-    pumpState = false;
-    lastPumpRunTime = millis();
-    digitalWrite(PIN_PUMP, HIGH);
-    Serial.println(F(">>> PUMP STOP"));
-  }
+void getFirebaseControls() {
+  if (Firebase.getString(fbData, "/growbox/controls/mode")) currentMode = fbData.stringData();
+  if (Firebase.getBool(fbData, "/growbox/controls/lightOn")) lightOn = fbData.boolData();
+  if (Firebase.getString(fbData, "/growbox/controls/spectrum")) spectrum = fbData.stringData();
+  
+  bool requestedPump = false;
+  if (Firebase.getBool(fbData, "/growbox/controls/pumpOn")) requestedPump = fbData.boolData();
+  
+  if (requestedPump && !pumpOn && !soilError) {
+    pumpOn = true; pumpStartTime = millis(); 
+  } else if (!requestedPump && pumpOn) {
+    pumpOn = false;
+  }
+  if (Firebase.getBool(fbData, "/growbox/controls/fanOn")) fanOn = fbData.boolData();
+  if (Firebase.getInt(fbData, "/growbox/controls/soilTarget")) soilTarget = fbData.intData();
+  if (Firebase.getInt(fbData, "/growbox/controls/humTarget")) humTarget = fbData.intData();
+  if (Firebase.getString(fbData, "/growbox/controls/climate")) currentClimate = fbData.stringData();
+  if (Firebase.getString(fbData, "/growbox/controls/stage")) currentStage = fbData.stringData();
 }
 
-void checkPumpTimer() {
-  if (pumpState && (millis() - pumpStartTime >= PUMP_DURATION)) {
-    turnPumpOff();
-  }
+void applyControls() {
+  if (currentMode == "AUTO") {
+    if (!soilError) {
+      if (!pumpOn && soilPct < soilTarget && (millis() - lastPumpRunTime > PUMP_COOLDOWN)) {
+        pumpOn = true; pumpStartTime = millis();
+        Firebase.setBool(fbData, "/growbox/controls/pumpOn", true);
+        sendBotMessage(" Авто-полив");
+      }
+    } else {
+      pumpOn = false; 
+    }
+    
+    // Вентиляція
+    if (!ahtError && ((hum > humTarget + 5) || airQuality > 40) && !fanOn) {
+      fanOn = true; Firebase.setBool(fbData, "/growbox/controls/fanOn", true);
+    } else if (hum < humTarget && airQuality <= 35 && fanOn) {
+      fanOn = false; Firebase.setBool(fbData, "/growbox/controls/fanOn", false);
+    }
+
+    // Світло
+    if (isDark && !lightOn) {
+      lightOn = true; Firebase.setBool(fbData, "/growbox/controls/lightOn", true);
+    } else if (!isDark && lightOn) {
+      lightOn = false; Firebase.setBool(fbData, "/growbox/controls/lightOn", false);
+    }
+  }
+
+  digitalWrite(PIN_PUMP, pumpOn ? HIGH : LOW);
+
+  if (pumpOn) {
+    digitalWrite(PIN_FAN, LOW); 
+    FastLED.setBrightness(20);
+  } else {
+    digitalWrite(PIN_FAN, fanOn ? HIGH : LOW);
+    FastLED.setBrightness(100);
+  }
+
+  if (!lightOn) { fill_solid(leds, NUM_LEDS, CRGB::Black); } 
+  else {
+    if (spectrum == "blue") fill_solid(leds, NUM_LEDS, CRGB(0, 0, 255));
+    else if (spectrum == "red") fill_solid(leds, NUM_LEDS, CRGB(255, 0, 0));
+    else fill_solid(leds, NUM_LEDS, CRGB(255, 0, 255)); 
+  }
+  FastLED.show();
 }
 
-void runAutoLogic() {
-  if (!autoMode) return;
-
-  struct tm timeinfo;
-  bool timeSynced = getLocalTime(&timeinfo);
-  if (timeSynced) {
-    int startHour = 6;
-    int endHour = startHour + lightDurationHours;
-    
-    bool isDaySchedule = (timeinfo.tm_hour >= startHour && timeinfo.tm_hour < endHour);
-
-    bool shouldLedBeOn = isDaySchedule && sensors.isDark;
-    digitalWrite(PIN_LED, shouldLedBeOn ? HIGH : LOW);
-
-    if (shouldLedBeOn != lastLedState) {
-      if (shouldLedBeOn) {
-        sendBotMessage("🌑 Сонце сіло (темно). Освітлення УВІМКНЕНО 💡");
-      } else {
-        if (!isDaySchedule) {
-          sendBotMessage("🌙 Час підтримання освітленості вийшов. Освітлення ВИМКНЕНО 😴");
-        } else {
-          sendBotMessage("☀️ Зійшло сонце (світло). Освітлення ВИМКНЕНО 🌤");
-        }
-      }
-      lastLedState = shouldLedBeOn;
-    }
-  }
-  
-  if (sensors.soilPct < soilThreshold && !pumpState) {
-    if (millis() - lastPumpRunTime > PUMP_COOLDOWN) {
-      Serial.println(F("Auto: Soil dry. Pump ON."));
-      turnPumpOn(false);
-    }
-  }
-}
-
-void renderLCD() {
-  lcd.clear();
-  struct tm timeinfo;
-  if (!getLocalTime(&timeinfo)) { 
-    lcd.print("WiFi connecting..."); 
-    return; 
-  }
-  renderBigTime(timeinfo.tm_hour, timeinfo.tm_min);
-  lcd.setCursor(0,3);
-  lcd.printf("T:%.0f S:%d%% %s", sensors.temp, sensors.soilPct, autoMode?"A":"M");
-}
-
-void renderBigTime(int h, int m) {
-  int startCol = 1;
-  drawDigit(startCol, h/10); drawDigit(startCol+4, h%10);
-  lcd.setCursor(startCol+7,0); lcd.print(" "); lcd.setCursor(startCol+7,1); lcd.print(":");
-  drawDigit(startCol+9, m/10); drawDigit(startCol+13, m%10);
-}
-
-void drawDigit(int col, int num) {
-  for (int row=0; row<2; row++) {
-    for (int i=0; i<3; i++) {
-      lcd.setCursor(col+i, row);
-      uint8_t c = bigDigits[num][row][i];
-      if(c==32) lcd.print(" "); else lcd.write(c);
-    }
-  }
-}
-
-float getAHTTemp()     { return sensors.temp; }
-float getAHTHum()      { return sensors.hum; }
-int getSoilPercent()   { return sensors.soilPct; }
-bool isDark()          { return sensors.isDark; }
-bool getPumpState()    { return pumpState; }
-bool isAutoMode()      { return autoMode; }
-int getSoilThreshold() { return soilThreshold; }
-int getLightDuration() { return lightDurationHours; }
-String getModeName()   { return currentModeName; }
-bool getLedState()     { return lastLedState; }
-
-void setPlantMode(int mode) {
-  autoMode = true;
-  switch (mode) {
-    case 1: currentModeName="Tropical"; soilThreshold=60; lightDurationHours=12; break;
-    case 2: currentModeName="Succulent"; soilThreshold=20; lightDurationHours=14; break;
-    case 3: currentModeName="Vegetable"; soilThreshold=45; lightDurationHours=16; break;
-    default: currentModeName="Custom"; break;
-  }
-}
-
-void manualPumpControl(bool on) {
-  autoMode = false;
-  currentModeName = "Manual";
-  if (on) turnPumpOn(true); else turnPumpOff();
-}
-
-void setCustomThreshold(int val) {
-  autoMode = true;
-  currentModeName = "Custom";
-  soilThreshold = constrain(val, 0, 100);
+void updateLCD() {
+  lcd.setCursor(0,0); lcd.printf("T:%.1fC H:%.0f%%  ", temp, hum);
+  lcd.setCursor(0,1);
+  if (soilError) lcd.print("Soil: ERR! Air:"); else lcd.printf("Soil:%d%% Air:", soilPct);
+  lcd.printf("%d%% ", airQuality);
+  lcd.setCursor(0,2); lcd.printf("Mode: %s   ", currentMode.c_str());
+  lcd.setCursor(0,3);
+  if (pumpOn) {
+    lcd.printf("P:1 F:0(ECO) L:D   ");
+  } else {
+    lcd.printf("P:0 F:%d L:%d      ", fanOn, lightOn);
+  }
 }
